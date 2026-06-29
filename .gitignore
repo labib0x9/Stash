@@ -1,2 +1,4 @@
 up.yaml
 parser/parser
+test/runnig_prog
+test/sleep_prog
