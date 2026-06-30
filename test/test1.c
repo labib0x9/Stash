@@ -22,7 +22,7 @@ int main() {
     printf("Sleep(): Going to sleep....\n");
 
     time_t start = time(NULL);
-    sleep(100000);
+    sleep(10);
     time_t end = time(NULL);
 
     printf("Woke up...\n");

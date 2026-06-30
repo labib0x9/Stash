@@ -7,3 +7,5 @@ test/sleep_prog
 
 dump_register/dump
 dump_register/regs.bin
+
+regs.bin
