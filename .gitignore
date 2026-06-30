@@ -1,4 +1,9 @@
 up.yaml
 parser/parser
-test/runnig_prog
+checkpoint.json
+region/*
+test/running_prog
 test/sleep_prog
+
+dump_register/dump
+dump_register/regs.bin

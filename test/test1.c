@@ -9,12 +9,14 @@ int g[5] = {1, 2, 3, 4, 5};
 int main() {
 
     int s[3] = {100, 200, 300};
-    int *h = malloc(4 * sizeof(int));
+    int *h = malloc(1024 * sizeof(int));
     if (!h) {
         perror("malloc() failed");
         return 1;
     }
-    h[3] = 3000;
+    h[1000] = 3000;
+
+    printf("malloc = %p\n", h);
 
     printf("PID = %d\n", getpid());
     printf("Sleep(): Going to sleep....\n");
