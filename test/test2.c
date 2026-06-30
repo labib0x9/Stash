@@ -20,7 +20,7 @@ int main() {
     printf("While(): Going to sleep....\n");
 
     time_t start = time(NULL);
-    while (time(NULL) - start < 5) {}
+    while (time(NULL) - start < 60) {}
 
     printf("Woke up...\n");
     printf("h[3] = %d\n", h[3]);

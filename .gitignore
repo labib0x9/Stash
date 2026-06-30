@@ -7,5 +7,7 @@ test/sleep_prog
 
 dump_register/dump
 dump_register/regs.bin
+dump_register/region
+dump_register/checkpoint.bin
 
 regs.bin

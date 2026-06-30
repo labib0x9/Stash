@@ -18,6 +18,13 @@
 #define MAX_PATH 256
 #define MAX_REGIONS 256
 
+typedef enum {
+    REGION_DATA,
+    REGION_HEAP,
+    REGION_STACK,
+    REGION_ANON,
+} RegionKind;
+
 typedef struct {
     unsigned long start;
     unsigned long end;
@@ -25,6 +32,7 @@ typedef struct {
     char path[MAX_PATH];
     unsigned char *content;
     size_t size;
+    RegionKind kind;
 } Region;
 
 typedef struct {
@@ -37,6 +45,7 @@ typedef struct {
     char *environ;
     size_t environ_len;
     char cwd[MAX_PATH];
+    char exe_path[MAX_PATH];
     struct user_regs_struct regs;
     int have_regs;
 } Status;
@@ -129,6 +138,26 @@ static void parse_status(const char *pid, Status *st) {
     fclose(f);
 }
 
+static void parse_exe(const char *pid, Status *st) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%s/exe", pid);
+
+    ssize_t n = readlink(path, st->exe_path, sizeof(st->exe_path) - 1);
+    if (n < 0) { perror("readlink exe"); exit(1); }
+    st->exe_path[n] = '\0';
+}
+
+/* Classification rules (no hardcoded addresses):
+ *
+ *   Data:  pathname == executable, perms == "rw-p"
+ *   Heap:  pathname == "", perms == "rw-p", and the immediately
+ *          preceding mapping was the executable's rw-p (Data) segment
+ *          -- the anonymous region right after Data is BSS/heap.
+ *   Stack: pathname == "[stack]"
+ *
+ * Anything else writable+private that doesn't match is kept as a
+ * generic anonymous region.
+ */
 static void parse_maps(const char *pid, Status *st) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%s/maps", pid);
@@ -137,7 +166,7 @@ static void parse_maps(const char *pid, Status *st) {
     if (!f) { perror("fopen maps"); exit(1); }
 
     char line[MAX_LINE];
-    char prev[MAX_PATH] = "";
+    int prev_was_data = 0;
 
     while (fgets(line, sizeof(line), f)) {
         unsigned long start, end;
@@ -147,19 +176,30 @@ static void parse_maps(const char *pid, Status *st) {
         /* addr perms offset dev inode [pathname] */
         int n = sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*d %255s",
                         &start, &end, perms, mpath);
-        if (n < 3) continue; /* malformed line, skip */
+        if (n < 3) { prev_was_data = 0; continue; } /* malformed line, skip */
 
-        int is_rw = (perms[0] == 'r' && perms[1] == 'w');
+        int is_priv_rw = (strcmp(perms, "rw-p") == 0);
+        int is_stack = (strcmp(mpath, "[stack]") == 0);
+        int is_data = is_priv_rw && st->exe_path[0] && strcmp(mpath, st->exe_path) == 0;
+        int is_heap = is_priv_rw && mpath[0] == '\0' && prev_was_data;
+
+        RegionKind kind;
         int keep = 0;
 
-        if (is_rw) {
-            if (strstr(mpath, "stack")) {
-                keep = 1;
-            } else if (st->name[0] && strstr(mpath, st->name)) {
-                keep = 1;
-            } else if (mpath[0] == '\0' && st->name[0] && strstr(prev, st->name)) {
-                keep = 1;
-            }
+        if (is_stack) {
+            kind = REGION_STACK;
+            keep = 1;
+        } else if (is_data) {
+            kind = REGION_DATA;
+            keep = 1;
+        } else if (is_heap) {
+            kind = REGION_HEAP;
+            keep = 1;
+        } else if (is_priv_rw) {
+            /* still rw-p and private but doesn't match a named rule --
+             * keep as a generic anonymous/mapped region */
+            kind = REGION_ANON;
+            keep = 1;
         }
 
         if (keep && st->region_count < MAX_REGIONS) {
@@ -170,9 +210,12 @@ static void parse_maps(const char *pid, Status *st) {
             strncpy(r->path, mpath, sizeof(r->path) - 1);
             r->content = NULL;
             r->size = 0;
+            r->kind = kind;
         }
 
-        strncpy(prev, mpath, sizeof(prev) - 1);
+        /* heap detection depends on the *immediately preceding* maps
+         * line being the Data segment, not just any kept region */
+        prev_was_data = is_data;
     }
     fclose(f);
 }
@@ -226,10 +269,12 @@ static void parse_cwd(const char *pid, Status *st) {
  *   u32 have_regs, [struct user_regs_struct regs] (raw, if have_regs)
  *   for each region:
  *     u64 start, u64 end
+ *     u32 kind (0=data 1=heap 2=stack 3=anon)
  *     u32 perms_len, char perms[perms_len]
  *     u32 path_len, char path[path_len]
  *
- * region bytes are written to region/<start>-<end>.bin separately
+ * region bytes are written separately to region/data.bin, region/heap.bin,
+ * region/stack.bin, or region/anon-<start>-<end>.bin depending on kind
  */
 
 static void write_u32(FILE *f, uint32_t v) { fwrite(&v, sizeof(v), 1, f); }
@@ -259,18 +304,41 @@ static void save(Status *st) {
         Region *r = &st->regions[i];
         write_u64(f, r->start);
         write_u64(f, r->end);
+        write_u32(f, (uint32_t)r->kind);
         write_blob(f, r->perms, (uint32_t)strlen(r->perms));
         write_blob(f, r->path, (uint32_t)strlen(r->path));
     }
     fclose(f);
 
     mkdir("region", 0755);
+    int data_n = 0, heap_n = 0, stack_n = 0;
     for (int i = 0; i < st->region_count; i++) {
         Region *r = &st->regions[i];
         if (!r->content) continue;
 
-        char name[128];
-        snprintf(name, sizeof(name), "region/%lx-%lx.bin", r->start, r->end);
+        char name[160];
+        switch (r->kind) {
+        case REGION_DATA:
+            data_n++;
+            if (data_n == 1) snprintf(name, sizeof(name), "region/data.bin");
+            else snprintf(name, sizeof(name), "region/data%d.bin", data_n);
+            break;
+        case REGION_HEAP:
+            heap_n++;
+            if (heap_n == 1) snprintf(name, sizeof(name), "region/heap.bin");
+            else snprintf(name, sizeof(name), "region/heap%d.bin", heap_n);
+            break;
+        case REGION_STACK:
+            stack_n++;
+            if (stack_n == 1) snprintf(name, sizeof(name), "region/stack.bin");
+            else snprintf(name, sizeof(name), "region/stack%d.bin", stack_n);
+            break;
+        case REGION_ANON:
+        default:
+            snprintf(name, sizeof(name), "region/anon-%lx-%lx.bin", r->start, r->end);
+            break;
+        }
+
         FILE *rf = fopen(name, "wb");
         if (!rf) { perror("fopen region file"); exit(1); }
 
@@ -309,10 +377,13 @@ int main(int argc, char **argv) {
      * mutates underneath us mid-checkpoint */
     attach_and_get_regs(pid, &st);
 
+    parse_exe(pid_str, &st);
     parse_maps(pid_str, &st);
     printf("found %d regions\n", st.region_count);
 
     read_regions(pid_str, &st);
+
+    detach(pid);
 
     char path[64];
     snprintf(path, sizeof(path), "/proc/%s/cmdline", pid_str);
@@ -332,8 +403,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < st.region_count; i++) {
         free(st.regions[i].content);
     }
-
-    detach(pid);
 
     return 0;
 }
